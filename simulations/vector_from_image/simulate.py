@@ -1,0 +1,162 @@
+# basic imports
+import os
+import numpy as np
+import pyqtgraph as qg
+import pandas as pd
+import sys
+# tensorflow
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import model_from_json
+# framework imports
+
+from custom_modules.renderers.renderers import BlenderOnlineRenderer
+from custom_modules.observations.image_observations import ImageObservationFOV
+from cobel.observations.dictionary_observations import DictionaryObservations
+from custom_modules.spatial_representations.hexagonal_topology import HexagonalGraphAllocentric
+from cobel.agents.multi_dict_dqn import DQNAgentMultiModal
+from cobel.interfaces.oai_gym_interface import OAIGymInterface
+from cobel.analysis.rl_monitoring.rl_performance_monitors import RewardMonitor
+
+from aux.callbacks import RewardFunction, TrainingLogger
+
+# shall the system provide visual output while performing the experiments?
+# NOTE: do NOT use visualOutput=True in parallel experiments, visualOutput=True should only be used in explicit calls to 'singleRun'! 
+visual_output = True
+move_goal_at = 10
+turn_obs_off = 30
+keep_off_for = 10
+
+network = "../../networks/double_image_network.json"
+json_file   = open(network, 'r')
+loaded_model_json = json_file.read()
+json_file.close()  
+model = model_from_json(loaded_model_json)    
+print(model.summary())
+
+df = pd.DataFrame(columns=['run','trial','steps','reward']) 
+data_folder = 'data/sim_vector_network/'
+
+def turn_off_observation(logs) : 
+    trial    = logs['trial']
+    rl_agent = logs['rl_parent']
+    observation = rl_agent.interface_OAI.modules['observation']
+    inputs = ['image_input', 'vector_image_input']
+    
+    if trial%turn_obs_off == 0 :
+        choice = np.random.choice(inputs)
+        observation.obs_modules[choice].set_observation_state(False)
+        print("Turned off ", choice )
+    if trial%turn_obs_off == keep_off_for : 
+        
+        observation.obs_modules['image_input'].set_observation_state(True)
+        observation.obs_modules['vector_image_input'].set_observation_state(True)
+        print("Turned both on")
+    
+input_files = [np.load(file) for file in ['inputs/input_images_guidance.npy',
+                                          'inputs/input_images_guidance.npy']]
+   
+def single_run(run=1):
+    '''
+    This method performs a single experimental run, i.e. one experiment. It has to be called by either a parallelization mechanism (without visual output),
+    or by a direct call (in this case, visual output can be used).
+    '''
+    run_data_folder = data_folder+'run_'+run
+    print("Run : ", run)    
+    np.random.seed()
+    # this is the main window for visual output
+    # normally, there is no visual output, so there is no need for an output window
+    main_window = None
+    # if visual output is required, activate an output window
+    if visual_output:
+        main_window = qg.GraphicsWindow(title='Demo: DQN')
+        
+    if not os.path.exists(run_data_folder) :
+        os.makedirs(run_data_folder)
+    if not os.path.exists(run_data_folder+'/weights') :
+        os.makedirs(run_data_folder+'/weights')
+    if not os.path.exists(run_data_folder+'/activations') :     
+       os.makedirs(run_data_folder+'/activations')
+    
+    # determine demo scene path
+    demo_scene = os.path.abspath(__file__).split('emergent_spatial_representations')[0] + '/emergent_spatial_representations/worlds/guidance.blend'
+    print(demo_scene)
+    # a dictionary that contains all employed modules
+    modules = {}
+    modules['world'] = BlenderOnlineRenderer(demo_scene)
+    vector_observation = ImageObservationFOV(modules['world'], main_window, visual_output,
+                                                 imageDims=(72, 12), view_angle=240.0, noise=None) #predict vector from image
+    image_observation = ImageObservationFOV(modules['world'], main_window, visual_output,
+                                                 imageDims=(72, 12), view_angle=240.0, noise=None)
+    modules['observation'] = DictionaryObservations({'image_input':image_observation,
+                                                     'vector_image_input':vector_observation})   
+    modules['spatial_representation'] = HexagonalGraphAllocentric(n_nodes_x=5, n_nodes_y=5,
+                                                       n_neighbors=6, goal_nodes=[11],
+                                                       visual_output=True, 
+                                                       world_module=modules['world'],
+                                                       use_world_limits=True, 
+                                                       observation_module=modules['observation'], 
+                                                       rotation=True)
+    modules['spatial_representation'].set_visual_debugging(main_window)
+    reward_function = RewardFunction(step_reward=-1.0, goal_reward=1.0)
+    modules['rl_interface'] = OAIGymInterface(modules, visual_output, 
+                                              reward_function.reward_callback)
+    
+    # amount of trials
+    number_of_trials = 4000
+    # maximum steps per trial
+    max_steps = 100
+    record_interval = 500
+    record_activations_at = np.arange(0,number_of_trials+record_interval, record_interval)
+    # initialize reward monitor
+    reward_monitor = RewardMonitor(number_of_trials, main_window, visual_output, 
+                                   [-max_steps, 10])
+    
+    data_logger = TrainingLogger(run_data_folder, record_activations_at=record_activations_at, 
+                             input_files=input_files, compute_zero_inputs=True)
+    # initialize RL agent
+    rl_agent = DQNAgentMultiModal(modules['rl_interface'], 3000, 0.3, model=model, 
+                                custom_callbacks={'on_trial_end': [reward_monitor.update,
+                                                                   data_logger.record_training_data,
+                                                                   turn_off_observation,
+                                                                   data_logger.save_intermediate_activations]})
+                                                                   
+    #if we'd like to record intermediate activations, define a keras function
+    analysis_model = rl_agent.model
+    activations_layer = 'analysis'
+    keras_function = K.function([analysis_model.get_layer('image_input').input, 
+                                          analysis_model.get_layer('vector_image_input').input],
+                                         [analysis_model.get_layer(activations_layer).output])
+    data_logger.add_keras_function(keras_function)
+    
+    # eventually, allow the OAI class to access the robotic agent class
+    modules['rl_interface'].rl_agent = rl_agent
+    
+    # and allow the topology class to access the rlAgent
+    modules['spatial_representation'].rl_agent = rl_agent
+    
+    # let the agent learn, with extremely large number of allowed maximum steps
+    rl_agent.train(number_of_trials, max_steps)
+    
+    x = np.array(data_logger.training_data)
+    x = np.hstack((int(run)*np.ones(number_of_trials).reshape(number_of_trials,1), x))
+    logs = df.append(pd.DataFrame(x, columns=df.columns), ignore_index=True)
+    logs.to_csv(data_folder+'training_log.csv', sep='\t', encoding='utf-8',index=False,
+              mode='a', header=not os.path.exists(data_folder+'training_log.csv'))
+    
+    rl_agent.agent.save_weights(run_data_folder+'/weights/weights_trial_{}.h5'.format(number_of_trials))
+    # clear keras session (for performance)
+
+    K.clear_session()
+    
+    # stop simulation
+    modules['world'].stopBlender()
+    
+    # and also stop visualization
+    if visual_output:
+        main_window.close()
+
+if __name__ == '__main__':
+            
+    single_run(sys.argv[1])
+# clear keras session (for performance)
+    K.clear_session()
