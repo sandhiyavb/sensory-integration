@@ -1,0 +1,15 @@
+opencv-python-headless>=4.2.0.32
+keras==2.9.0
+keras-rl2
+gym==0.25.0
+Shapely==1.8.2
+testresources
+tensorflow==2.9.1
+pyqtgraph==0.11.1
+mlagents>=0.24.0
+mlagents-envs>=0.24.0
+PyQt5>=5.15.0
+PyQt5-sip>=12.7.1
+PyQt5-stubs>=5.14.2.0
+scipy
+pandas==1.4.3
