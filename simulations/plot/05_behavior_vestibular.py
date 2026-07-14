@@ -4,7 +4,6 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from analysis.learning_and_behavior import direct_paths_to_goal
 from scipy.stats import wilcoxon
 
 def start_valid_island(a, accuracy, window_size=3):
